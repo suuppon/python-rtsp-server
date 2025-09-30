@@ -5,7 +5,7 @@ from hashlib import md5
 from _config import Config
 from shared import Shared
 from log import Log
-
+from urllib.parse import urljoin
 
 class Camera:
     def __init__(self, camera_hash):
@@ -47,24 +47,41 @@ class Camera:
 
         self.description = _get_description(reply)
 
-        self.track_ids = _get_track_ids(reply)
+        tracks = self._extract_track_controls(self.url["url"], reply)
+        if not tracks:
+            raise RuntimeError('No a=control found in SDP')
 
+        # video 트랙 우선, 없으면 첫 번째
+        video_tracks = [u for (kind, u) in tracks if kind == 'video']
+        self.track_urls = []
+        if video_tracks:
+            self.track_urls.append(video_tracks[0])
+            # 나머지 트랙(오디오 등)도 필요하면 추가
+            for kind, u in tracks:
+                if u != video_tracks[0]:
+                    self.track_urls.append(u)
+        else:
+            self.track_urls = [tracks[0][1]]
+
+        # 첫 번째 트랙 SETUP (URL 그대로 사용)
         reply, code = await self._request(
             'SETUP',
-            f'{self.url["url"]}/{self.track_ids[0]}',
-            self._get_transport_line(0))
+            self.track_urls[0],
+            self._get_transport_line(0)
+        )
 
         self.session_id = _get_session_id(reply)
 
-        if len(self.track_ids) > 1:
+        # 두 번째 트랙이 있다면 추가 SETUP (예: 오디오)
+        if len(self.track_urls) > 1:
             await self._request(
                 'SETUP',
-                f'{self.url["url"]}/{self.track_ids[1]}',
+                self.track_urls[1],
                 self._get_transport_line(1),
-                f'Session: {self.session_id}')
+                f'Session: {self.session_id}'
+            )
 
         self.rtp_info = None
-
         Log.write(f'Camera: connected [{self.hash}]')
 
     async def play(self):
@@ -215,6 +232,38 @@ class Camera:
         except Exception as e:
             Log.print(f"Camera: error: can't create_datagram_endpoint: {e}")
 
+    def _extract_track_controls(self, describe_url, reply):
+        """DESCRIBE 응답에서 SDP를 꺼내 a=control 값을 절대 RTSP URL로 추출."""
+        # SDP 추출
+        blocks = reply.split('\r\n\r\n', 2)
+        if len(blocks) < 2:
+            raise RuntimeError('Invalid DESCRIBE reply')
+        sdp = blocks[1].strip()
+
+        # base URL (상대 control일 때 합치기)
+        base = describe_url if describe_url.endswith('/') else describe_url + '/'
+
+        ctrls = []
+        current_media = None  # 'video' / 'audio' 등
+
+        for raw in sdp.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith('m='):
+                # 예: m=video 0 RTP/AVP 96
+                parts = line.split()
+                current_media = parts[0][2:] if len(parts) > 0 else None
+                continue
+            if line.startswith('a=control:'):
+                ctrl = line.split(':', 1)[1].strip()
+                if not ctrl or ctrl == '*':
+                    continue
+                # 상대경로 → 절대화
+                if not ctrl.startswith('rtsp://'):
+                    ctrl = urljoin(base, ctrl)
+                ctrls.append((current_media, ctrl))
+        return ctrls
 
 class CameraUdpProtocol(asyncio.DatagramProtocol):
     """ This callback will be called when connection to the camera is made
@@ -307,11 +356,11 @@ def _get_description(reply):
 def _get_track_ids(reply):
     """ Search track ID in rtsp reply
     """
-    track_ids = re.findall(r'\na=control:.*?((?:track|stream).*?\d)', reply)
-    if not track_ids:
-        raise RuntimeError('Invalid track ID in reply')
-    return track_ids
-
+    # track_ids = re.findall(r'\na=control:.*?((?:track|stream).*?\d)', reply)
+    # if not track_ids:
+    #     raise RuntimeError('Invalid track ID in reply')
+    # return track_ids
+    raise NotImplementedError('Use _extract_track_controls() instead.')
 
 def _get_session_id(reply):
     """ Search session ID in rtsp reply
